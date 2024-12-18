@@ -1,198 +1,70 @@
-  vars:
-    namespace: services
-    registry_image: busybox:latest
-    test_deployment_name: registry-check
+- name: Wait for pods to be in "Running" state
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ namespace }}"
+    label_selectors:
+      - app={{ test_deployment_name }}
+  register: pod_info
+  until: >
+    pod_info.resources | map(attribute='status.phase') | select('equalto', 'Running') | length == {{ worker_node_list | length }}
+  retries: 30
+  delay: 10
 
-    - name: Check if logged into OpenShift
-      command: oc whoami
-      register: login_check
+- name: Get failing pods details
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ namespace }}"
+    label_selectors:
+      - app={{ test_deployment_name }}
+  register: pod_details
+
+- name: Display failing pods information
+  debug:
+    msg: >
+      {{ pod_details.resources | selectattr('status.phase', 'ne', 'Running') |
+      map(attribute='metadata.name') | join(', ') | default('All pods are running') }}
+
+- name: Get pod distribution across nodes
+  set_fact:
+    pod_distribution: >
+      {{ pod_details.resources | groupby('spec.nodeName') | dict() }}
+
+- name: Display pod distribution
+  debug:
+    msg: "{{ pod_distribution }}"
+
+- name: Verify pod distribution across workers
+  set_fact:
+    pods_per_node: "{{ pod_details.resources | map(attribute='spec.nodeName') | unique | length }}"
+
+- name: Check if pods are distributed across all worker nodes
+  fail:
+    msg: >
+      Pods are not distributed across all worker nodes.
+      Expected: {{ worker_node_list | length }}. Found: {{ pods_per_node }}.
+  when: pods_per_node != worker_node_list | length
+
+- name: Delete test deployment and pods
+  kubernetes.core.k8s:
+    state: absent
+    namespace: "{{ namespace }}"
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ test_deployment_name }}"
+
+- name: Remove local images
+  block:
+    - name: Remove test image
+      command:
+        cmd: podman rmi default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/{{ registry_image }}
       ignore_errors: true
 
-    - name: Fail if not logged into OpenShift
-      fail:
-        msg: "Not logged into OpenShift. Please run 'oc login' first."
-      when: login_check.rc != 0
-
-    - name: Get current project
-      command: oc project -q
-      register: current_project
-
-    - name: Switch to services namespace
-      command: oc project {{ namespace }}
-
-    - name: Clean up any previous test resources
-      command: "{{ item }}"
-      ignore_errors: true
-      with_items:
-        - "oc delete deployment {{ test_deployment_name }} -n {{ namespace }}"
-        - "oc delete pods -l app={{ test_deployment_name }} -n {{ namespace }}"
-
-    - name: Get worker nodes
-      command: oc get nodes -l node-role.kubernetes.io/worker -o name
-      register: worker_nodes
-
-    - name: Convert worker nodes output to list
-      set_fact:
-        worker_node_list: "{{ worker_nodes.stdout_lines }}"
-
-    - name: Fail if no worker nodes found
-      fail:
-        msg: "No worker nodes found in the cluster"
-      when: worker_node_list | length == 0
-
-    - name: Get cluster domain
-      command: oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}'
-      register: cluster_domain
-
-    - name: Expose OpenShift internal registry
-      command: >
-        oc patch configs.imageregistry.operator.openshift.io/cluster 
-        --type merge 
-        -p '{"spec":{"defaultRoute":true}}'
+    - name: Remove busybox image
+      command:
+        cmd: podman rmi {{ registry_image }}
       ignore_errors: true
 
-    - name: Wait for registry route to be available
-      command: oc get route default-route -n openshift-image-registry
-      register: registry_route
-      until: registry_route.rc == 0
-      retries: 10
-      delay: 10
-      ignore_errors: true
-
-    - name: Get OpenShift authentication token
-      command: oc whoami -t
-      register: oc_token
-
-    - name: Login to internal registry
-      command: >
-        podman login -u {{ login_check.stdout }} 
-        -p {{ oc_token.stdout }}
-        --tls-verify=false 
-        default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}
-
-    - name: Pull test image
-      command: podman pull {{ registry_image }}
-
-    - name: Tag image for internal registry
-      command: >
-        podman tag {{ registry_image }} 
-        default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/{{ registry_image }}
-
-    - name: Push image to internal registry
-      command: >
-        podman push --tls-verify=false
-        default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/{{ registry_image }}
-
-    - name: Get worker node hostnames
-      shell: oc get nodes -l node-role.kubernetes.io/worker -o jsonpath='{.items[*].metadata.name}'
-      register: worker_hostnames
-
-    - name: Create test deployment
-      command: |
-        cat << EOF | oc apply -f -
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: {{ test_deployment_name }}
-          namespace: {{ namespace }}
-        spec:
-          replicas: {{ worker_node_list | length }}
-          selector:
-            matchLabels:
-              app: {{ test_deployment_name }}
-          template:
-            metadata:
-              labels:
-                app: {{ test_deployment_name }}
-            spec:
-              affinity:
-                nodeAffinity:
-                  requiredDuringSchedulingIgnoredDuringExecution:
-                    nodeSelectorTerms:
-                    - matchExpressions:
-                      - key: kubernetes.io/hostname
-                        operator: In
-                        values:
-                        {{ worker_hostnames.stdout.split() | to_yaml | indent(8) }}
-              containers:
-              - name: test-container
-                image: image-registry.openshift-image-registry.svc:5000/{{ namespace }}/{{ registry_image }}
-                command: ["sleep", "3600"]
-        EOF
-
-    - name: Wait for pods to be ready
-      shell: |
-        READY_PODS=$(oc get pods -l app={{ test_deployment_name }} -o json | jq '.items[] | select(.status.phase=="Running") | .metadata.name' | wc -l)
-        TOTAL_WORKERS={{ worker_node_list | length }}
-        if [ "$READY_PODS" -eq "$TOTAL_WORKERS" ]; then
-          exit 0
-        else
-          exit 1
-        fi
-      register: pods_ready
-      until: pods_ready.rc == 0
-      retries: 30
-      delay: 10
-
-    - name: Get failing pods details
-      shell: |
-        echo "=== Pods Not in Running State ==="
-        oc get pods -l app={{ test_deployment_name }} -o json | \
-        jq -r '.items[] | select(.status.phase!="Running") | "Pod: \(.metadata.name)\nStatus: \(.status.phase)\nNode: \(.spec.nodeName)\nEvents:\n\(.status.conditions[].message // "No conditions")\n"'
-        
-        echo "=== Pod Events ==="
-        oc get events --field-selector involvedObject.kind=Pod,involvedObject.namespace={{ namespace }} --sort-by='.lastTimestamp'
-      register: failing_pods
-      when: pods_ready.rc != 0
-
-    - name: Display failing pods information
-      debug:
-        msg: "{{ failing_pods.stdout_lines }}"
-      when: pods_ready.rc != 0
-
-    - name: Get pod distribution
-      shell: oc get pods -l app={{ test_deployment_name }} -o custom-columns='POD:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase'
-      register: pod_distribution
-
-    - name: Display pod distribution
-      debug:
-        msg: "{{ pod_distribution.stdout_lines }}"
-
-    - name: Verify pod distribution across workers
-      shell: |
-        PODS_PER_NODE=$(oc get pods -l app={{ test_deployment_name }} -o json | jq -r '.items[].spec.nodeName' | sort | uniq | wc -l)
-        TOTAL_WORKERS={{ worker_node_list | length }}
-        if [ "$PODS_PER_NODE" -eq "$TOTAL_WORKERS" ]; then
-          echo "Success: Pods are distributed across all worker nodes"
-          exit 0
-        else
-          echo "Failed: Pods are not distributed across all worker nodes"
-          exit 1
-        fi
-      register: distribution_check
-
-    - name: Show distribution check results
-      debug:
-        msg: "{{ distribution_check.stdout_lines }}"
-
-    - name: Return to original project
-      command: oc project {{ current_project.stdout }}
-
-    - name: Cleanup resources
-      block:
-        - name: Delete test deployment
-          command: oc delete deployment {{ test_deployment_name }} -n {{ namespace }}
-          ignore_errors: true
-
-        - name: Delete test pods
-          command: oc delete pods -l app={{ test_deployment_name }} -n {{ namespace }}
-          ignore_errors: true
-
-        - name: Remove local image
-          command: podman rmi default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/{{ registry_image }}
-          ignore_errors: true
-
-        - name: Remove busybox image
-          command: podman rmi {{ registry_image }}
-          ignore_errors: true
-      when: distribution_check is defined
