@@ -1,4 +1,44 @@
-- name: Set worker node facts
+# Verify OpenShift CLI access and authentication
+    - name: Check if logged into OpenShift
+      command: oc whoami
+      register: login_check
+      ignore_errors: true
+
+    - name: Fail if not logged into OpenShift
+      fail:
+        msg: "Not logged into OpenShift. Please run 'oc login' first."
+      when: login_check.rc != 0
+
+    # Track and manage project context
+    - name: Get current project
+      command: oc project -q
+      register: current_project
+
+    - name: Switch to services namespace
+      command: oc project {{ namespace }}
+
+    # Clean up any leftover resources from previous runs
+    - name: Clean up any previous test resources
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        namespace: "{{ namespace }}"
+        name: "{{ item.name }}"
+      loop:
+        - { api_version: apps/v1, kind: Deployment, name: "{{ test_deployment_name }}" }
+      ignore_errors: true
+
+    # Gather worker node information
+    - name: Get worker nodes
+      kubernetes.core.k8s_info:
+        kind: Node
+        label_selectors:
+          - node-role.kubernetes.io/worker
+      register: worker_nodes
+
+    # Process worker node information for later use
+    - name: Set worker node facts
       set_fact:
         worker_node_list: "{{ worker_nodes.resources | map(attribute='metadata.name') | list }}"
         worker_count: "{{ worker_nodes.resources | length }}"
@@ -8,6 +48,7 @@
         msg: "No worker nodes found in the cluster"
       when: worker_count == 0
 
+    # Get cluster domain for registry URL construction
     - name: Get cluster domain
       kubernetes.core.k8s_info:
         api_version: config.openshift.io/v1
@@ -19,80 +60,49 @@
       set_fact:
         cluster_domain: "{{ cluster_info.resources[0].spec.domain }}"
 
+    # Configure internal registry access
     - name: Expose OpenShift internal registry
-      kubernetes.core.k8s_patch:
-        kind: Config
-        api_version: imageregistry.operator.openshift.io/v1
-        name: cluster
-        patch:
-          spec:
-            defaultRoute: true
-        patch_type: merge
+      command: >
+        oc patch configs.imageregistry.operator.openshift.io/cluster 
+        --type merge 
+        -p '{"spec":{"defaultRoute":true}}'
+      ignore_errors: true
 
+    # Wait for registry route to be ready
+    - name: Wait for registry route to be available
+      command: oc get route default-route -n openshift-image-registry
+      register: registry_route
+      until: registry_route.rc == 0
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    # Get authentication token for registry access
     - name: Get OpenShift authentication token
       command: oc whoami -t
       register: oc_token
 
-    - name: Create debug pod
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Pod
-          metadata:
-            name: debug-container
-            namespace: "{{ namespace }}"
-          spec:
-            containers:
-            - name: debug
-              image: registry.redhat.io/rhel8/support-tools
-              command: ['sleep', '3600']
-              securityContext:
-                privileged: true
-              volumeMounts:
-              - name: host
-                mountPath: /host
-            volumes:
-            - name: host
-              hostPath:
-                path: /
-            nodeSelector:
-              node-role.kubernetes.io/worker: ""
+    # Perform registry operations on a worker node
+    - name: Debug worker node and perform registry operations
+      shell: |
+        # Select first worker node for the operation
+        WORKER_NODE=$(oc get nodes -l node-role.kubernetes.io/worker -o name | head -1)
+        
+        # Use oc debug to access the node and perform operations
+        oc debug $WORKER_NODE -- bash -c "
+          podman login -u {{ login_check.stdout }} \
+          -p {{ oc_token.stdout }} \
+          --tls-verify=false \
+          default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }} && \
+          podman pull {{ registry_image }} && \
+          podman tag {{ registry_image }} \
+          default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}/{{ registry_image }} && \
+          podman push --tls-verify=false \
+          default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}/{{ registry_image }}
+        "
+      register: debug_result
 
-    - name: Wait for debug pod to be ready
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Pod
-        name: debug-container
-        namespace: "{{ namespace }}"
-        wait: yes
-        wait_condition:
-          type: Ready
-          status: "True"
-      register: debug_pod
-
-    - name: Login to internal registry from debug pod
-      command: >
-        oc exec -n {{ namespace }} debug-container -- chroot /host podman login -u {{ login_check.stdout }} 
-        -p {{ oc_token.stdout }}
-        --tls-verify=false
-        default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}
-
-    - name: Pull test image from debug pod
-      command: >
-        oc exec -n {{ namespace }} debug-container -- chroot /host podman pull {{ registry_image }}
-
-    - name: Tag image for internal registry from debug pod
-      command: >
-        oc exec -n {{ namespace }} debug-container -- chroot /host podman tag {{ registry_image }} 
-        default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}/{{ registry_image }}
-
-    - name: Push image to internal registry from debug pod
-      command: >
-        oc exec -n {{ namespace }} debug-container -- chroot /host podman push 
-        --tls-verify=false
-        default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}/{{ registry_image }}
-
+    # Create test deployment to verify pod scheduling
     - name: Create test deployment
       kubernetes.core.k8s:
         state: present
@@ -125,6 +135,7 @@
                   image: "image-registry.openshift-image-registry.svc:5000/{{ namespace }}/{{ registry_image }}"
                   command: ["sleep", "3600"]
 
+    # Wait for deployment to be fully available
     - name: Wait for deployment to be ready
       kubernetes.core.k8s_info:
         api_version: apps/v1
@@ -137,6 +148,7 @@
           status: "True"
       register: deployment_status
 
+    # Get status of all pods in the deployment
     - name: Get pods status
       kubernetes.core.k8s_info:
         api_version: v1
@@ -146,6 +158,7 @@
           - app={{ test_deployment_name }}
       register: test_pods
 
+    # Detailed investigation of any failing pods
     - name: Get failing pods details
       when: test_pods.resources | length != worker_count
       block:
@@ -179,6 +192,7 @@
           debug:
             msg: "{{ pod_events.resources | map(attribute='message') | list }}"
 
+    # Verify distribution of pods across worker nodes
     - name: Verify pod distribution
       kubernetes.core.k8s_info:
         api_version: v1
@@ -188,6 +202,7 @@
           - app={{ test_deployment_name }}
       register: distribution_check
 
+    # Show final pod distribution results
     - name: Show pod distribution
       debug:
         msg: |
@@ -198,22 +213,28 @@
             Status: {{ pod.status.phase }}
           {% endfor %}
 
+    # Return to original project context
     - name: Return to original project
       command: oc project {{ current_project.stdout }}
 
+    # Clean up all resources
     - name: Cleanup resources
-      kubernetes.core.k8s:
-        state: absent
-        definition: "{{ item }}"
-      loop:
-        - apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: "{{ test_deployment_name }}"
-            namespace: "{{ namespace }}"
-        - apiVersion: v1
-          kind: Pod
-          metadata:
-            name: debug-container
-            namespace: "{{ namespace }}"
-      ignore_errors: true
+      block:
+        - name: Delete deployment
+          kubernetes.core.k8s:
+            state: absent
+            definition:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: "{{ test_deployment_name }}"
+                namespace: "{{ namespace }}"
+          ignore_errors: true
+
+        - name: Remove podman image from node
+          shell: |
+            WORKER_NODE=$(oc get nodes -l node-role.kubernetes.io/worker -o name | head -1)
+            oc debug $WORKER_NODE -- bash -c "
+              podman rmi default-route-openshift-image-registry.apps.{{ cluster_domain }}/{{ namespace }}/{{ registry_image }} {{ registry_image }}
+            "
+          ignore_errors: true
