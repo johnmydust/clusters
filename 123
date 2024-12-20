@@ -1,1 +1,2 @@
 Na początku zrobiłem to w ten sposób, ale miałem problem z dynamicznym ustawieniem liczby węzłów, ponieważ w polu replicas wymaga się wartości typu integer, i nie mogłem tego obejść żadnym innym rozwiązaniem niż to, które zastosowałem.
+Jak chciałbyś to przerobić?
