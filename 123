@@ -1,1 +1,19 @@
-Myślałem, że lepiej będzie to robić bezpośrednio z węzła. Jeśli chcesz, mogę to przerobić, abyśmy mogli przesłać obraz do wewnętrznego rejestru używając tylko poleceń oc.
+- name: Pull busybox image
+          community.docker.docker_image:
+            name: docker.io/library/busybox:latest
+            source: pull
+
+        - name: Tag for internal registry
+          community.docker.docker_image:
+            name: docker.io/library/busybox:latest
+            repository: default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/busybox
+            source: local
+
+        - name: Push to internal registry
+          community.docker.docker_image:
+            name: default-route-openshift-image-registry.apps.{{ cluster_domain.stdout }}/{{ namespace }}/busybox:latest
+            push: true
+            source: local
+            username: "{{ login_check.stdout }}"
+            password: "{{ token.stdout }}"
+
